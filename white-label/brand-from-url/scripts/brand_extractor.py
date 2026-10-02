@@ -14,7 +14,7 @@ Given a website URL, fetches the homepage and extracts:
 Writes a JSON file every downstream skill (brand.json) can reuse.
 
 Usage:
-    python brand_extractor.py https://example.com /mnt/user-data/uploads/brand.json
+    python brand_extractor.py https://example.com brand.json
     python brand_extractor.py https://example.com   # prints to stdout
 """
 
@@ -33,10 +33,7 @@ from PIL import Image
 
 
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (compatible; BrandFromURL/1.0; "
-        "+brand-extractor; respecting robots.txt)"
-    ),
+    "User-Agent": "Mozilla/5.0 (compatible; BrandFromURL/1.0; +brand-extractor)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
 }
@@ -65,17 +62,45 @@ def _safe_get(url: str) -> requests.Response | None:
 def _abs(base: str, link: str | None) -> str | None:
     if not link or link.startswith("data:"):
         return None
-    return urljoin(base, link)
+    try:
+        return urljoin(base, link)
+    except ValueError:  # e.g. a malformed IPv6 literal in an href
+        return None
 
 
 def _rgb_to_hex(rgb): return "#{:02X}{:02X}{:02X}".format(*rgb)
 
 
+_HEX_RE = re.compile(
+    r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$"
+)
+
+
+def _normalize_hex(value) -> str | None:
+    """Return a CSS hex colour as #RRGGBB, or None if it is not one.
+
+    Accepts #RGB, #RGBA, #RRGGBB and #RRGGBBAA. Any alpha channel is dropped,
+    because the white-label schema and the report generators expect #RRGGBB.
+    """
+    if not isinstance(value, str):
+        return None
+    m = _HEX_RE.match(value.strip())
+    if not m:
+        return None
+    h = m.group(1)
+    if len(h) in (3, 4):
+        h = "".join(c * 2 for c in h[:3])
+    return "#" + h[:6].upper()
+
+
 def _hex_to_rgb(h):
-    h = h.lstrip("#")
-    if len(h) == 3:
-        h = "".join(c * 2 for c in h)
+    h = (_normalize_hex(h) or "#000000").lstrip("#")
     return tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+
+
+def _approximates(a: str, b: str, tol: int = 16) -> bool:
+    """True when two hex colours differ by at most `tol` on every channel."""
+    return all(abs(x - y) <= tol for x, y in zip(_hex_to_rgb(a), _hex_to_rgb(b)))
 
 
 def _luminance(rgb):
@@ -99,8 +124,13 @@ def colors_from_image_bytes(img_bytes: bytes) -> list[str]:
     except Exception:
         return []
     img.thumbnail((200, 200))
-    counts: dict = {}
-    for px in img.getdata():
+    # Group pixels into 16-step buckets to find the dominant colours, but report
+    # each bucket's average rather than its floor value, so a flat-colour logo
+    # yields its exact brand colour instead of a rounded one.
+    buckets: dict = {}
+    # Pillow 12.1 deprecated getdata() in favour of get_flattened_data().
+    pixels = img.get_flattened_data() if hasattr(img, "get_flattened_data") else img.getdata()
+    for px in pixels:
         if len(px) == 4:
             r, g, b, a = px
             if a < 200:
@@ -110,11 +140,12 @@ def colors_from_image_bytes(img_bytes: bytes) -> list[str]:
         q = (r // 16 * 16, g // 16 * 16, b // 16 * 16)
         if _is_neutral(q):
             continue
-        counts[q] = counts.get(q, 0) + 1
-    if not counts:
+        n, sr, sg, sb = buckets.get(q, (0, 0, 0, 0))
+        buckets[q] = (n + 1, sr + r, sg + g, sb + b)
+    if not buckets:
         return []
-    ranked = sorted(counts.items(), key=lambda kv: -kv[1])
-    return [_rgb_to_hex(rgb) for rgb, _ in ranked[:4]]
+    ranked = sorted(buckets.values(), key=lambda v: -v[0])
+    return [_rgb_to_hex((sr // n, sg // n, sb // n)) for n, sr, sg, sb in ranked[:4]]
 
 
 def _extract_jsonld(soup) -> list[dict]:
@@ -135,20 +166,43 @@ def _extract_jsonld(soup) -> list[dict]:
     return blocks
 
 
+def _text(value) -> str | None:
+    """Coerce a JSON-LD value to plain text.
+
+    schema.org lets most properties be a string, a number, an object with a
+    name (addressCountry is often {"@type": "Country", "name": "US"}), or a
+    list of any of those.
+    """
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, dict):
+        return _text(value.get("name") or value.get("@value"))
+    if isinstance(value, list):
+        for item in value:
+            text = _text(item)
+            if text:
+                return text
+    return None
+
+
 def _address_from_jsonld(blocks: list[dict]) -> str | None:
     for b in blocks:
         addr = b.get("address") if isinstance(b, dict) else None
+        if isinstance(addr, list):
+            addr = next((a for a in addr if a), None)
         if not addr:
             continue
         if isinstance(addr, str):
             return addr
         if isinstance(addr, dict):
             parts = [
-                addr.get("streetAddress"),
-                addr.get("addressLocality"),
-                addr.get("addressRegion"),
-                addr.get("postalCode"),
-                addr.get("addressCountry"),
+                _text(addr.get(key))
+                for key in ("streetAddress", "addressLocality", "addressRegion",
+                            "postalCode", "addressCountry")
             ]
             joined = ", ".join(p for p in parts if p)
             if joined:
@@ -165,11 +219,18 @@ def _social_from_links(soup, base) -> dict[str, str | None]:
         abs_href = _abs(base, href)
         if not abs_href:
             continue
-        low = abs_href.lower()
+        # Match on the hostname, not a substring of the URL: "x.com" is also
+        # the tail of dropbox.com, wix.com, fedex.com and many others.
+        try:
+            host = (urlparse(abs_href).hostname or "").lower()
+        except ValueError:
+            continue
+        if not host:
+            continue
         for platform, domains in SOCIAL_DOMAINS.items():
             if out[platform]:
                 continue
-            if any(d in low for d in domains):
+            if any(host == d or host.endswith("." + d) for d in domains):
                 out[platform] = abs_href
                 break
     return out
@@ -212,8 +273,13 @@ def extract_brand(url: str) -> dict:
 
     if not result["company_name"]:
         for b in jsonld:
-            if isinstance(b, dict) and b.get("@type") in ("Organization", "LocalBusiness") and b.get("name"):
-                result["company_name"] = b["name"].strip()
+            if not isinstance(b, dict):
+                continue
+            types = b.get("@type")
+            types = types if isinstance(types, list) else [types]
+            name = _text(b.get("name"))
+            if name and any(t in ("Organization", "LocalBusiness") for t in types):
+                result["company_name"] = name
                 break
 
     if not result["company_name"]:
@@ -279,9 +345,9 @@ def extract_brand(url: str) -> dict:
     extracted: list[str] = []
     theme = soup.find("meta", attrs={"name": "theme-color"})
     if theme and theme.get("content"):
-        c = theme["content"].strip()
-        if c.startswith("#") and 4 <= len(c) <= 9:
-            extracted.append(c.upper())
+        c = _normalize_hex(theme["content"])
+        if c:
+            extracted.append(c)
 
     for style in soup.find_all("style"):
         css = style.string or ""
@@ -289,7 +355,9 @@ def extract_brand(url: str) -> dict:
             r"--(?:brand|primary|accent|theme|main|color-?primary|"
             r"color-?accent|color-?brand)[^:]*:\s*(#[0-9a-fA-F]{3,8})", css
         ):
-            extracted.append(m.group(1).upper())
+            c = _normalize_hex(m.group(1))
+            if c:
+                extracted.append(c)
 
     logo_colors: list[str] = []
     if result["logo_url"]:
@@ -305,6 +373,14 @@ def extract_brand(url: str) -> dict:
                     result["warnings"].append(f"SVG logo found but cairosvg failed: {e}")
             else:
                 logo_colors = colors_from_image_bytes(logo_resp.content)
+
+    # A logo colour that only approximates a colour the site declares itself
+    # (theme-color or a CSS brand variable) is the same colour seen through
+    # image resampling. Keep the declared one.
+    logo_colors = [
+        c for c in logo_colors
+        if not any(_approximates(c, declared) for declared in extracted)
+    ]
 
     seen, merged = set(), []
     for c in extracted + logo_colors:
